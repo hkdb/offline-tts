@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>OfflineTTS</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <h1><img src="icons/icon48.png" alt="" style="height: 32px; width: 32px; vertical-align: middle; margin-right: 6px;">OfflineTTS</h1>
+  
+  <div id="status" class="status loading">
+    <span id="status-text">Loading models...</span>
+    <span id="backend-badge" class="backend-badge hidden"></span>
+  </div>
+  
+  <div class="control-group">
+    <label>Voice Style</label>
+    <select id="voice-select">
+      <option value="M1">Male 1 (M1)</option>
+      <option value="M2">Male 2 (M2)</option>
+      <option value="F1">Female 1 (F1)</option>
+      <option value="F2">Female 2 (F2)</option>
+    </select>
+  </div>
+  
+  <div class="control-group">
+    <label>
+      Speed
+      <span class="speed-value" id="speed-value">1.0x</span>
+    </label>
+    <input type="range" id="speed-range" min="0.5" max="2.0" step="0.1" value="1.0">
+  </div>
+  
+  <div class="buttons">
+    <button id="play-btn" class="btn-primary" disabled>Read Page</button>
+    <button id="pause-btn" class="seek-btn" disabled title="Pause/Resume">❚❚</button>
+    <button id="stop-btn" class="btn-danger" disabled>Stop</button>
+  </div>
+  
+  <div class="seek-container">
+    <button id="seek-back-btn" class="seek-btn" disabled title="Skip Back (Alt+,)">◀◀</button>
+    <div class="seek-track" id="seek-track">
+      <div class="seek-fill" id="seek-fill"></div>
+      <div class="seek-handle" id="seek-handle"></div>
+    </div>
+    <button id="seek-forward-btn" class="seek-btn" disabled title="Skip Forward (Alt+.)">▶▶</button>
+  </div>
+  <div class="seek-info">
+    <span id="chunk-current">0</span> / <span id="chunk-total">0</span>
+  </div>
+  
+  <div class="info">
+    💡 To read any part of the page, select text, right-click to show the context menu, & click "Read with OfflineTTS".
+  </div>
+  
+  <script src="popup.js"></script>
+</body>
+</html>

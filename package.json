@@ -1,0 +1,45 @@
+{
+  "name": "OfflineTTS",
+  "version": "0.01.00",
+  "type": "module",
+  "description": "A Chrome extension that reads web pages and PDFs aloud using Supertonic's high-quality neural TTS voices - completely open source, offline and private.",
+  "directories": {
+    "lib": "lib"
+  },
+  "scripts": {
+    "build": "webpack --mode production",
+    "build:dev": "webpack --mode development",
+    "watch": "webpack --watch --mode development",
+    "package": "npm run build && cd build && zip -r ../extension.zip ."
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hkdb/offline-tts.git"
+  },
+  "keywords": [
+    "tts",
+    "text-to-speech",
+    "speech-synthesis",
+    "offline",
+    "chrome-extension",
+    "browser-extension",
+    "onnx",
+    "supertonic",
+    "accessibility",
+    "screen-reader",
+    "pdf-reader",
+    "privacy"
+  ],
+  "author": "hkdb",
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "copy-webpack-plugin": "^13.0.1",
+    "html-webpack-plugin": "^5.6.5",
+    "webpack": "^5.103.0",
+    "webpack-cli": "^6.0.1"
+  },
+  "dependencies": {
+    "onnxruntime-web": "^1.23.2",
+    "pdfjs-dist": "^5.4.394"
+  }
+}

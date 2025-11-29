@@ -1,0 +1,28 @@
+# Environment
+.env
+
+# Editor/IDE
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Build output
+build/
+*.zip
+
+# Node modules
+node_modules/
+build/
+
+# Third-party dependencies
+# Note: ONNX Runtime is now in node_modules (installed via npm)
+# Only model files need to be downloaded with scripts/download-deps.sh
+
+# ONNX models (download with scripts/download-deps.sh)
+assets/onnx/*.onnx

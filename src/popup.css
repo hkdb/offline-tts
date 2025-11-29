@@ -1,0 +1,407 @@
+body {
+  width: 320px;
+  padding: 16px;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  margin: 8px;
+  border-radius: 12px;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.15);
+}
+
+h1 {
+  font-size: 18px;
+  margin: 0 0 12px 0;
+  color: #333;
+}
+
+.status {
+  padding: 8px 12px;
+  background: #f0f0f0;
+  border-radius: 4px;
+  margin-bottom: 12px;
+  font-size: 13px;
+  color: #666;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.status.loading {
+  background: #fff3cd;
+  color: #856404;
+}
+
+.status.ready {
+  background: #d4edda;
+  color: #155724;
+}
+
+.status.error {
+  background: #f8d7da;
+  color: #721c24;
+}
+
+.backend-badge {
+  font-size: 11px;
+  padding: 5px 10px;
+  border-radius: 10px;
+  background: #ffffff;
+  color: #666;
+  font-weight: 500;
+  white-space: nowrap;
+  flex-shrink: 0;
+  border: 1px solid #d0d0d0;
+}
+
+.backend-badge.wasm {
+  background: #ffffff;
+  color: #666;
+  border-color: #d0d0d0;
+}
+
+.backend-badge.webgpu {
+  background: #ffffff;
+  color: #4a7c4a;
+  border-color: #c0d8c0;
+}
+
+.backend-badge.hidden {
+  display: none;
+}
+
+.control-group {
+  margin-bottom: 16px;
+}
+
+label {
+  display: block;
+  font-size: 13px;
+  font-weight: 500;
+  margin-bottom: 6px;
+  color: #555;
+}
+
+select {
+  width: 100%;
+  padding: 8px;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  font-size: 13px;
+  box-sizing: border-box;
+}
+
+input[type="range"] {
+  width: 100%;
+  height: 8px;
+  border-radius: 4px;
+  background: #ddd;
+  outline: none;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #2f96f6;
+  cursor: pointer;
+  border: 2px solid white;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+}
+
+input[type="range"]::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #2f96f6;
+  cursor: pointer;
+  border: 2px solid white;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+}
+
+.speed-value {
+  float: right;
+  color: #888;
+  font-size: 12px;
+}
+
+
+/* Seek bar styles */
+.seek-container {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  padding: 8px 0;
+}
+
+.seek-btn {
+  flex: 0 0 auto;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  font-size: 12px;
+  font-weight: bold;
+  background: #6c757d;
+  color: white;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  user-select: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.seek-btn:hover:not(:disabled) {
+  background: #545b62;
+}
+
+.seek-btn:active:not(:disabled) {
+  background: #3d4246;
+}
+
+.seek-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.seek-track {
+  flex: 1;
+  height: 8px;
+  background: #ddd;
+  border-radius: 4px;
+  position: relative;
+  cursor: pointer;
+}
+
+.seek-fill {
+  height: 100%;
+  background: #2f96f6;
+  border-radius: 4px;
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 0%;
+  pointer-events: none;
+}
+
+.seek-handle {
+  width: 16px;
+  height: 16px;
+  background: #2f96f6;
+  border: 2px solid white;
+  border-radius: 50%;
+  position: absolute;
+  top: 50%;
+  left: 0%;
+  transform: translate(-50%, -50%);
+  cursor: grab;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+  z-index: 10;
+}
+
+.seek-handle:active {
+  cursor: grabbing;
+  transform: translate(-50%, -50%) scale(1.1);
+}
+
+.seek-handle.disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.seek-info {
+  text-align: center;
+  font-size: 12px;
+  color: #666;
+  margin-top: 4px;
+}
+
+.buttons {
+  display: flex;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+button {
+  flex: 1;
+  padding: 10px;
+  border: none;
+  border-radius: 4px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-primary {
+  background: #2f96f6;
+  color: white;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: #2080d6;
+}
+
+.btn-danger {
+  background: #dc3545;
+  color: white;
+}
+
+.btn-danger:hover:not(:disabled) {
+  background: #c82333;
+}
+
+.info {
+  font-size: 12px;
+  color: #888;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid #eee;
+  padding-left: 1.5em;
+  text-indent: -1.5em;
+}
+
+/* Dark mode support */
+@media (prefers-color-scheme: dark) {
+  body {
+    background: #1e1e1e;
+    color: #e0e0e0;
+    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.4);
+  }
+  
+  h1 {
+    color: #ffffff;
+  }
+  
+  .status {
+    background: #2d2d2d;
+    color: #b0b0b0;
+  }
+  
+  .status.loading {
+    background: #4a3f00;
+    color: #ffd54f;
+  }
+  
+  .status.ready {
+    background: #1b3d1b;
+    color: #81c784;
+  }
+  
+  .status.error {
+    background: #4a1c1c;
+    color: #ef9a9a;
+  }
+  
+  .backend-badge {
+    background: #1e1e1e;
+    color: #aaa;
+    border-color: #4a4a4a;
+  }
+  
+  .backend-badge.wasm {
+    background: #1e1e1e;
+    color: #aaa;
+    border-color: #4a4a4a;
+  }
+  
+  .backend-badge.webgpu {
+    background: #1e1e1e;
+    color: #8cb88c;
+    border-color: #3a5a3a;
+  }
+  
+  label {
+    color: #b0b0b0;
+  }
+  
+  select {
+    background: #2d2d2d;
+    border-color: #444;
+    color: #e0e0e0;
+  }
+  
+  select option {
+    background: #2d2d2d;
+    color: #e0e0e0;
+  }
+  
+  input[type="range"] {
+    background: #444;
+  }
+  
+  input[type="range"]::-webkit-slider-thumb {
+    background: #2f96f6;
+    border-color: #1e1e1e;
+  }
+  
+  input[type="range"]::-moz-range-thumb {
+    background: #2f96f6;
+    border-color: #1e1e1e;
+  }
+  
+  .speed-value {
+    color: #888;
+  }
+  
+
+  .info {
+    color: #888;
+    border-top-color: #333;
+  }
+  
+  .btn-primary {
+    background: #2f96f6;
+  }
+  
+  .btn-primary:hover:not(:disabled) {
+    background: #2080d6;
+  }
+  
+  .btn-danger {
+    background: #dc3545;
+  }
+  
+  .btn-danger:hover:not(:disabled) {
+    background: #bb2d3b;
+  }
+  
+  .seek-track {
+    background: #444;
+  }
+  
+  .seek-fill {
+    background: #2f96f6;
+  }
+  
+  .seek-handle {
+    background: #2f96f6;
+    border-color: #1e1e1e;
+  }
+  
+  .seek-btn {
+    background: #444;
+  }
+  
+  .seek-btn:hover:not(:disabled) {
+    background: #555;
+  }
+  
+  .seek-btn:active:not(:disabled) {
+    background: #333;
+  }
+  
+  .seek-info {
+    color: #888;
+  }
+}
