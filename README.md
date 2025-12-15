@@ -27,9 +27,11 @@ v0.01.0 feature complete with some outstanding improvements pending. WebGPU supp
 
 ## 📦 Installation
 
-Coming soon to the Google Web Store for easy installation.
+Install it via the Chrome Web Store:
 
-In the meantime, or if you prefer to avoid Google entirely, you can install it locally. Instructions are [here](docs/INSTALL.md).
+[![Chrome Web Store](docs/offline-tts-promo-440x280.png)](https://chromewebstore.google.com/detail/offlinetts/nfbppcifgekipkdbcolhkpcilehoinkl)
+
+Or if you prefer to avoid Google entirely, you can install it locally. Instructions are [here](docs/INSTALL.md).
 
 ## 💻 Usage
 
