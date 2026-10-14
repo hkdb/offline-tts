@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "OfflineTTS",
-  "version": "0.01.00",
+  "version": "0.2.0",
   "description": "Read web pages and PDFs aloud with open source natural TTS voices (supertonic) - offline, private, and local",
   
   "cross_origin_opener_policy": {

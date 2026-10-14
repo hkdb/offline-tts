@@ -1,6 +1,6 @@
 {
   "name": "OfflineTTS",
-  "version": "0.01.00",
+  "version": "0.2.0",
   "type": "module",
   "description": "A Chrome extension that reads web pages and PDFs aloud using Supertonic's high-quality neural TTS voices - completely open source, offline and private.",
   "directories": {

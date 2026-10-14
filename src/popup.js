@@ -15,6 +15,9 @@
  */
 
 // Popup UI logic
+//
+// Renders from chrome.storage.session (written by background) and sends all
+// commands to background, which owns the offscreen document
 const statusEl = document.getElementById('status');
 const voiceSelect = document.getElementById('voice-select');
 const speedRange = document.getElementById('speed-range');
@@ -32,18 +35,29 @@ const seekHandle = document.getElementById('seek-handle');
 const chunkCurrentEl = document.getElementById('chunk-current');
 const chunkTotalEl = document.getElementById('chunk-total');
 
-let currentlyPaused = false;
-let currentBackend = null; // Store current backend (webgpu/wasm)
-let currentStatusType = 'loading'; // Store current status type
-let currentStatusMessage = 'Loading models...'; // Store current status message
+const HOLD_DELAY_MS = 300;  // Press longer than this on a skip button to scrub instead of skipping once
+
+// Mirror of the session storage keys written by background
+const state = {
+  playbackStatus: 'stopped',
+  modelStatus: null,
+  modelError: null,
+  backend: null,
+  currentChunk: 0,
+  totalChunks: 0
+};
+let errorMessage = null;  // Last error reported by background, shown until state changes
 
 // Seek bar state
-let totalChunks = 0;
-let currentChunk = 0;
 let pendingChunk = null;  // The chunk we're seeking to (while dragging/holding)
+let holdDirection = 0;
+let holdTimeout = null;
 let holdInterval = null;
 let isDragging = false;
 let isHolding = false;
+
+// Ask background to start loading models now so they're ready when the user clicks Read
+chrome.runtime.sendMessage({ type: 'warmup' }).catch(() => {});
 
 // Update speed slider fill
 function updateSpeedSliderFill() {
@@ -62,12 +76,7 @@ speedRange.addEventListener('input', () => {
   chrome.storage.local.set({ speed: newSpeed });
   updateSpeedSliderFill();
   
-  // Send live speed update to offscreen for immediate effect
-  chrome.runtime.sendMessage({ 
-    target: 'offscreen', 
-    type: 'updateSpeed', 
-    speed: newSpeed 
-  });
+  chrome.runtime.sendMessage({ type: 'setSpeed', speed: newSpeed }).catch(() => {});
 });
 
 // Initialize slider fill on load
@@ -78,148 +87,101 @@ voiceSelect.addEventListener('change', () => {
   chrome.storage.local.set({ voice: voiceSelect.value });
 });
 
-// Load saved settings and playback state
-chrome.storage.local.get(['voice', 'speed', 'modelStatus', 'playbackStatus', 'backend'], (result) => {
-  // Store backend if available
-  if (result.backend) {
-    currentBackend = result.backend;
-  }
+// Load saved settings
+chrome.storage.local.get(['voice', 'speed'], (result) => {
   if (result.voice) voiceSelect.value = result.voice;
   if (result.speed) {
     speedRange.value = result.speed;
     speedValue.textContent = `${result.speed}x`;
     updateSpeedSliderFill();
   }
+});
+
+// Load playback/model state and follow changes
+chrome.storage.session.get(Object.keys(state), (result) => {
+  Object.assign(state, result);
+  render();
+});
+
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== 'session') return;
   
-  if (result.modelStatus === 'ready') {
-    // Check playback status
-    if (result.playbackStatus === 'buffering') {
-      showStatus('loading', 'Buffering...');
-      setBufferingState();
-    } else if (result.playbackStatus === 'playing') {
-      showStatus('ready', 'Playing...');
-      setPlayingState();
-    } else if (result.playbackStatus === 'paused') {
-      showStatus('ready', 'Paused');
-      setPausedState();
-    } else {
-      showStatus('ready', 'Models loaded! Ready to read.');
-      setStoppedState();
+  let changed = false;
+  for (const [key, { newValue }] of Object.entries(changes)) {
+    if (key in state) {
+      state[key] = newValue;
+      changed = true;
     }
-  } else if (result.modelStatus === 'error') {
-    showStatus('error', 'Error loading models. Check console.');
-  } else {
-    // Still loading
-    showStatus('loading', 'Loading models...');
-    setLoadingState();
+  }
+  if (changed) {
+    if (changes.playbackStatus) {
+      errorMessage = null;
+    }
+    render();
   }
 });
 
-// Listen for model status updates
+// Errors are transient, so background sends them as messages
 chrome.runtime.onMessage.addListener((message) => {
-  if (message.type === 'modelStatus') {
-    if (message.status === 'loading') {
-      showStatus('loading', message.message || 'Loading models...');
-    } else if (message.status === 'ready') {
-      playBtn.disabled = false;
-      chrome.storage.local.set({ modelStatus: 'ready' });
-      // Store backend if included in message
-      if (message.backend) {
-        currentBackend = message.backend;
-        chrome.storage.local.set({ backend: message.backend });
-      }
-      showStatus('ready', 'Models loaded! Ready to read.');
-    } else if (message.status === 'error') {
-      showStatus('error', `Error: ${message.message}`);
-      chrome.storage.local.set({ modelStatus: 'error' });
-    }
-  } else if (message.type === 'backendStatus') {
-    // Handle dedicated backend status update
-    currentBackend = message.backend;
-    chrome.storage.local.set({ backend: message.backend });
-    // Refresh the current status to show backend
-    showStatus(currentStatusType, currentStatusMessage);
-  } else if (message.type === 'playbackStatus') {
-    if (message.status === 'buffering') {
-      setBufferingState();
-      // Check if models are still loading
-      chrome.storage.local.get(['modelStatus'], (result) => {
-        if (result.modelStatus !== 'ready') {
-          showStatus('loading', 'Loading models... Please wait.');
-        } else {
-          showStatus('loading', 'Buffering...');
-        }
-      });
-    } else if (message.status === 'playing') {
-      setPlayingState();
-      showStatus('ready', 'Playing...');
-    } else if (message.status === 'paused') {
-      setPausedState();
-      showStatus('ready', 'Paused');
-    } else if (message.status === 'stopped') {
-      setStoppedState();
-      showStatus('ready', 'Ready to read.');
-    }
-  } else if (message.type === 'progressUpdate') {
-    // Update seek bar position
-    updateSeekBar(message.currentChunk, message.totalChunks);
-  } else if (message.type === 'error') {
-    // Show error message from background
-    showStatus('error', message.message || 'An error occurred');
-    setStoppedState();
+  if (message.type === 'error') {
+    errorMessage = message.message || 'An error occurred';
+    render();
   }
 });
 
-// State management functions
-function setBufferingState() {
-  playBtn.disabled = true;
-  pauseBtn.disabled = true;
-  pauseBtn.textContent = '❚❚';
-  stopBtn.disabled = false; // Allow stopping while buffering
-  seekBackBtn.disabled = true;
-  seekForwardBtn.disabled = true;
-  currentlyPaused = false;
+// ============ RENDERING ============
+
+function render() {
+  const status = state.playbackStatus || 'stopped';
+  const modelsReady = state.modelStatus === 'ready';
+  
+  // Buttons
+  const active = status !== 'stopped';
+  playBtn.disabled = active || state.modelStatus === 'error';
+  pauseBtn.disabled = !active;
+  pauseBtn.textContent = status === 'paused' ? '▶' : '❚❚';
+  stopBtn.disabled = !active;
+  seekBackBtn.disabled = !active || state.totalChunks <= 0;
+  seekForwardBtn.disabled = !active || state.totalChunks <= 0;
+  
+  // Status line
+  if (errorMessage) {
+    showStatus('error', errorMessage);
+  } else if (state.modelStatus === 'error') {
+    showStatus('error', `Error loading models: ${state.modelError || 'check console'}`);
+  } else if (status === 'buffering') {
+    showStatus('loading', modelsReady ? 'Buffering...' : 'Loading models... Please wait.');
+  } else if (status === 'playing') {
+    showStatus('ready', 'Playing...');
+  } else if (status === 'paused') {
+    showStatus('ready', 'Paused');
+  } else if (modelsReady) {
+    showStatus('ready', 'Ready to read.');
+  } else {
+    showStatus('loading', 'Loading models...');
+  }
+  
+  updateSeekBar();
 }
 
-function setPlayingState() {
-  playBtn.disabled = true;
-  pauseBtn.disabled = false;
-  pauseBtn.textContent = '❚❚';
-  stopBtn.disabled = false;
-  seekBackBtn.disabled = false;
-  seekForwardBtn.disabled = false;
-  currentlyPaused = false;
+function showStatus(type, message) {
+  const statusTextEl = document.getElementById('status-text');
+  const backendBadgeEl = document.getElementById('backend-badge');
+  
+  statusEl.className = `status ${type}`;
+  statusTextEl.textContent = message;
+  
+  // Show backend badge if available (except for loading/error states)
+  if (state.backend && type !== 'loading' && type !== 'error') {
+    const displayName = state.backend === 'webgpu' ? '⚡ WebGPU' : '🔧 WASM (CPU)';
+    backendBadgeEl.textContent = displayName;
+    backendBadgeEl.className = `backend-badge ${state.backend}`;
+  } else {
+    backendBadgeEl.className = 'backend-badge hidden';
+  }
 }
 
-function setPausedState() {
-  playBtn.disabled = true;
-  pauseBtn.disabled = false;
-  pauseBtn.textContent = '▶';
-  stopBtn.disabled = false;
-  seekBackBtn.disabled = false;
-  seekForwardBtn.disabled = false;
-  currentlyPaused = true;
-}
-
-function setStoppedState() {
-  playBtn.disabled = false;
-  pauseBtn.disabled = true;
-  pauseBtn.textContent = '❚❚';
-  stopBtn.disabled = true;
-  seekBackBtn.disabled = true;
-  seekForwardBtn.disabled = true;
-  currentlyPaused = false;
-  // Reset seek bar
-  updateSeekBar(0, 0);
-}
-
-function setLoadingState() {
-  playBtn.disabled = true;
-  pauseBtn.disabled = true;
-  stopBtn.disabled = true;
-  seekBackBtn.disabled = true;
-  seekForwardBtn.disabled = true;
-}
+// ============ PLAYBACK BUTTONS ============
 
 // Guard against rapid double-clicks
 let isReadRequestInProgress = false;
@@ -232,16 +194,18 @@ playBtn.addEventListener('click', async () => {
   
   // Immediate feedback before async operations
   playBtn.disabled = true;
+  errorMessage = null;
   showStatus('loading', 'Starting...');
   
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  
-  chrome.runtime.sendMessage({
-    type: 'readPage',
-    tabId: tab.id,
-    voice: voiceSelect.value,
-    speed: parseFloat(speedRange.value)
-  });
+  if (tab) {
+    chrome.runtime.sendMessage({
+      type: 'readPage',
+      tabId: tab.id,
+      voice: voiceSelect.value,
+      speed: parseFloat(speedRange.value)
+    }).catch(() => {});
+  }
   
   // Reset flag after a short delay to allow legitimate re-clicks
   setTimeout(() => { isReadRequestInProgress = false; }, 1000);
@@ -249,32 +213,28 @@ playBtn.addEventListener('click', async () => {
 
 // Pause/Resume reading
 pauseBtn.addEventListener('click', () => {
-  if (currentlyPaused) {
-    chrome.runtime.sendMessage({ type: 'resumeReading' });
-  } else {
-    chrome.runtime.sendMessage({ type: 'pauseReading' });
-  }
+  const type = state.playbackStatus === 'paused' ? 'resumeReading' : 'pauseReading';
+  chrome.runtime.sendMessage({ type }).catch(() => {});
 });
 
 // Stop reading
 stopBtn.addEventListener('click', () => {
-  chrome.runtime.sendMessage({ type: 'stopReading' });
+  chrome.runtime.sendMessage({ type: 'stopReading' }).catch(() => {});
 });
 
 // ============ SEEK BAR LOGIC ============
 
-// Update seek bar visuals
-function updateSeekBar(current, total) {
-  currentChunk = current;
-  totalChunks = total;
+// Update seek bar visuals from state (chunk numbers shown 1-based)
+function updateSeekBar() {
+  const total = state.totalChunks || 0;
+  const current = state.currentChunk || 0;
   
-  chunkCurrentEl.textContent = current;
   chunkTotalEl.textContent = total;
   
   // Don't update position if user is dragging or holding
   if (!isDragging && !isHolding) {
-    const percent = total > 0 ? (current / total) * 100 : 0;
-    setSeekPosition(percent);
+    chunkCurrentEl.textContent = total > 0 ? current + 1 : 0;
+    setSeekPosition(chunkToPercent(current));
   }
 }
 
@@ -287,117 +247,107 @@ function setSeekPosition(percent) {
 
 // Convert percent to chunk index
 function percentToChunk(percent) {
-  if (totalChunks <= 0) return 0;
-  return Math.round((percent / 100) * (totalChunks - 1));
+  if (state.totalChunks <= 0) return 0;
+  const chunk = Math.round((percent / 100) * (state.totalChunks - 1));
+  return Math.max(0, Math.min(state.totalChunks - 1, chunk));
 }
 
 // Convert chunk index to percent
 function chunkToPercent(chunk) {
-  if (totalChunks <= 1) return 0;
-  return (chunk / (totalChunks - 1)) * 100;
+  if (state.totalChunks <= 1) return 0;
+  return (chunk / (state.totalChunks - 1)) * 100;
+}
+
+function showPendingChunk(chunk) {
+  setSeekPosition(chunkToPercent(chunk));
+  chunkCurrentEl.textContent = chunk + 1;
+}
+
+function sendSeek(chunkIndex) {
+  chrome.runtime.sendMessage({ type: 'seek', chunkIndex }).catch(() => {});
+}
+
+function sendSkip(delta) {
+  chrome.runtime.sendMessage({ type: 'skip', delta }).catch(() => {});
 }
 
 // Commit the seek (actually jump to the pending chunk)
 function commitSeek() {
-  if (pendingChunk !== null && pendingChunk !== currentChunk) {
-    console.log('[Popup] commitSeek() sending seek to chunk:', pendingChunk);
-    console.trace('[Popup] commitSeek() call stack');
-    chrome.runtime.sendMessage({ 
-      target: 'offscreen', 
-      type: 'seekToChunk', 
-      chunkIndex: pendingChunk 
-    });
+  if (pendingChunk !== null && pendingChunk !== state.currentChunk) {
+    sendSeek(pendingChunk);
   }
   pendingChunk = null;
 }
 
 // Move pending position by delta chunks
 function movePendingBy(delta) {
-  if (totalChunks <= 0) return;
+  if (state.totalChunks <= 0) return;
   
-  const base = pendingChunk !== null ? pendingChunk : currentChunk;
-  pendingChunk = Math.max(0, Math.min(totalChunks - 1, base + delta));
-  
-  // Update visual
-  setSeekPosition(chunkToPercent(pendingChunk));
-  chunkCurrentEl.textContent = pendingChunk;
+  const base = pendingChunk !== null ? pendingChunk : state.currentChunk;
+  pendingChunk = Math.max(0, Math.min(state.totalChunks - 1, base + delta));
+  showPendingChunk(pendingChunk);
 }
 
-// ============ CLICK HANDLERS (Queue skip) ============
-
-seekBackBtn.addEventListener('click', (e) => {
-  if (seekBackBtn.disabled) return;
-  // Single click = immediate skip back 1 chunk
-  if (!isHolding) {
-    console.log('[Popup] seekBackBtn click sending seek');
-    chrome.runtime.sendMessage({ target: 'offscreen', type: 'seekToChunk', chunkIndex: Math.max(0, currentChunk - 1) });
-  }
-});
-
-seekForwardBtn.addEventListener('click', (e) => {
-  if (seekForwardBtn.disabled) return;
-  // Single click = immediate skip forward 1 chunk
-  if (!isHolding) {
-    console.log('[Popup] seekForwardBtn click sending seek');
-    chrome.runtime.sendMessage({ target: 'offscreen', type: 'seekToChunk', chunkIndex: Math.min(totalChunks - 1, currentChunk + 1) });
-  }
-});
-
-// ============ HOLD HANDLERS (Auto-move) ============
+// ============ SKIP BUTTONS (click = skip one chunk, hold = scrub) ============
 
 function startHold(direction) {
-  if (totalChunks <= 0) return;
-  
-  isHolding = true;
-  pendingChunk = currentChunk;
-  
-  // Move immediately once
-  movePendingBy(direction);
-  
-  // Then continue moving every 150ms while held
-  holdInterval = setInterval(() => {
+  holdDirection = direction;
+  holdTimeout = setTimeout(() => {
+    holdTimeout = null;
+    isHolding = true;
+    pendingChunk = state.currentChunk;
     movePendingBy(direction);
-  }, 150);
+    holdInterval = setInterval(() => movePendingBy(direction), 150);
+  }, HOLD_DELAY_MS);
 }
 
-function stopHold() {
-  if (holdInterval) {
-    clearInterval(holdInterval);
-    holdInterval = null;
-  }
+/**
+ * @param {boolean} cancelled - Pointer left the button: commit a scrub, but don't count it as a click
+ */
+function endHold(cancelled) {
+  if (holdDirection === 0) return;
+  
+  clearTimeout(holdTimeout);
+  clearInterval(holdInterval);
+  holdTimeout = null;
+  holdInterval = null;
   
   if (isHolding) {
     isHolding = false;
     commitSeek();
+    updateSeekBar();
+  } else if (!cancelled) {
+    sendSkip(holdDirection);
   }
+  holdDirection = 0;
 }
 
-// Mouse events for hold
-seekBackBtn.addEventListener('mousedown', (e) => {
-  if (seekBackBtn.disabled) return;
-  e.preventDefault();
-  startHold(-1);
-});
+for (const [button, direction] of [[seekBackBtn, -1], [seekForwardBtn, 1]]) {
+  button.addEventListener('mousedown', (e) => {
+    if (button.disabled || e.button !== 0) return;
+    e.preventDefault();
+    startHold(direction);
+  });
+  button.addEventListener('mouseleave', () => endHold(true));
+  
+  // Keyboard activation (Enter/Space) fires click without mousedown
+  button.addEventListener('click', (e) => {
+    if (!button.disabled && e.detail === 0) {
+      sendSkip(direction);
+    }
+  });
+}
 
-seekForwardBtn.addEventListener('mousedown', (e) => {
-  if (seekForwardBtn.disabled) return;
-  e.preventDefault();
-  startHold(+1);
-});
-
-// Stop hold on mouseup/mouseleave (on document to catch all cases)
-document.addEventListener('mouseup', stopHold);
-seekBackBtn.addEventListener('mouseleave', stopHold);
-seekForwardBtn.addEventListener('mouseleave', stopHold);
+document.addEventListener('mouseup', () => endHold(false));
 
 // ============ DRAG HANDLE ============
 
 seekHandle.addEventListener('mousedown', (e) => {
-  if (totalChunks <= 0) return;
+  if (state.totalChunks <= 0) return;
   e.preventDefault();
   e.stopPropagation();  // Prevent mousedown from bubbling to track
   isDragging = true;
-  pendingChunk = currentChunk;
+  pendingChunk = state.currentChunk;
   seekHandle.style.cursor = 'grabbing';
 });
 
@@ -410,12 +360,10 @@ document.addEventListener('mousemove', (e) => {
   if (!isDragging) return;
   
   const rect = seekTrack.getBoundingClientRect();
-  const x = e.clientX - rect.left;
-  const percent = (x / rect.width) * 100;
+  const percent = ((e.clientX - rect.left) / rect.width) * 100;
   
   pendingChunk = percentToChunk(percent);
-  setSeekPosition(chunkToPercent(pendingChunk));
-  chunkCurrentEl.textContent = pendingChunk;
+  showPendingChunk(pendingChunk);
 });
 
 document.addEventListener('mouseup', () => {
@@ -423,67 +371,20 @@ document.addEventListener('mouseup', () => {
     isDragging = false;
     seekHandle.style.cursor = 'grab';
     commitSeek();
+    updateSeekBar();
   }
 });
 
 // ============ CLICK ON TRACK ============
 
-let lastSeekClickTime = 0;
-let lastSeekChunk = -1;
-
 seekTrack.addEventListener('click', (e) => {
-  console.log('[Popup] seekTrack click event fired, isDragging:', isDragging);
-  if (totalChunks <= 0) return;
-  if (isDragging) return; // Don't trigger on drag end
+  if (state.totalChunks <= 0 || isDragging) return;
   
   const rect = seekTrack.getBoundingClientRect();
-  const x = e.clientX - rect.left;
-  const percent = (x / rect.width) * 100;
-  
+  const percent = ((e.clientX - rect.left) / rect.width) * 100;
   const targetChunk = percentToChunk(percent);
   
-  // Prevent duplicate clicks to the same chunk within 100ms
-  const now = Date.now();
-  if (targetChunk === lastSeekChunk && now - lastSeekClickTime < 100) {
-    console.log('[Popup] Ignoring duplicate seek click to chunk', targetChunk);
-    return;
-  }
-  lastSeekClickTime = now;
-  lastSeekChunk = targetChunk;
-  
-  console.log('[Popup] seekTrack click sending seek to chunk:', targetChunk);
-  console.trace('[Popup] seekTrack click call stack');
-  
   // Update visual immediately
-  setSeekPosition(chunkToPercent(targetChunk));
-  chunkCurrentEl.textContent = targetChunk;
-  
-  // Seek to that chunk
-  chrome.runtime.sendMessage({ 
-    target: 'offscreen', 
-    type: 'seekToChunk', 
-    chunkIndex: targetChunk 
-  });
+  showPendingChunk(targetChunk);
+  sendSeek(targetChunk);
 });
-
-// ============ HELPERS ============
-
-function showStatus(type, message) {
-  currentStatusType = type;
-  currentStatusMessage = message;
-  
-  const statusTextEl = document.getElementById('status-text');
-  const backendBadgeEl = document.getElementById('backend-badge');
-  
-  statusEl.className = `status ${type}`;
-  statusTextEl.textContent = message;
-  
-  // Show backend badge if available (except for loading/error states)
-  if (currentBackend && type !== 'loading' && type !== 'error') {
-    const displayName = currentBackend === 'webgpu' ? '⚡ WebGPU' : '🔧 WASM (CPU)';
-    backendBadgeEl.textContent = displayName;
-    backendBadgeEl.className = `backend-badge ${currentBackend}`;
-  } else {
-    backendBadgeEl.className = 'backend-badge hidden';
-  }
-}

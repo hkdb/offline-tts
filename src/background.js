@@ -15,17 +15,22 @@
  */
 
 // Background service worker
+//
+// Playback state is kept in chrome.storage.session (not in globals) because Chrome
+// stops idle service workers; the popup renders from the same storage keys:
+//   playbackStatus ('stopped' | 'buffering' | 'playing' | 'paused'), currentChunk,
+//   totalChunks, readingTabId, resumeSession ({ text, voice }), modelStatus, modelError, backend
 
-let offscreenDocumentReady = false;
-let creatingOffscreenDocument = false;
-let isPlaying = false;
-let ttsModelReady = false;  // Track if TTS models are actually loaded
+const OFFSCREEN_URL = 'offscreen.html';
+const DEFAULT_SETTINGS = { voice: 'M1', speed: 1.0 };
+const ACTIVE_STATUSES = ['buffering', 'playing', 'paused'];
 
-// Badge animation state
+// ==== BADGE ====
+
 let badgeAnimationInterval = null;
 
 function startBufferingAnimation() {
-  stopBadgeAnimation();
+  if (badgeAnimationInterval) return;
   
   const frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
   let frameIndex = 0;
@@ -39,18 +44,6 @@ function startBufferingAnimation() {
   }, 120);
 }
 
-function setPlayingBadge() {
-  stopBadgeAnimation();
-  chrome.action.setBadgeBackgroundColor({ color: '#4CAF50' }); // Light Green
-  chrome.action.setBadgeText({ text: '♪' });
-}
-
-function setPausedBadge() {
-  stopBadgeAnimation();
-  chrome.action.setBadgeBackgroundColor({ color: '#FFA500' }); // Orange
-  chrome.action.setBadgeText({ text: '⏸' });
-}
-
 function stopBadgeAnimation() {
   if (badgeAnimationInterval) {
     clearInterval(badgeAnimationInterval);
@@ -58,123 +51,121 @@ function stopBadgeAnimation() {
   }
 }
 
-function clearBadge() {
-  stopBadgeAnimation();
-  chrome.action.setBadgeText({ text: '' });
-}
-
-// Create offscreen document for TTS processing
-async function setupOffscreenDocument() {
-  // Prevent race condition - don't create if already creating
-  if (creatingOffscreenDocument) {
-    // Wait for ongoing creation to complete
-    while (creatingOffscreenDocument) {
-      await new Promise(resolve => setTimeout(resolve, 100));
-    }
+function updateBadge(status) {
+  if (status === 'buffering') {
+    startBufferingAnimation();
     return;
   }
   
-  try {
-    // If already marked as ready, trust that unless we're debugging
-    if (offscreenDocumentReady && !creatingOffscreenDocument) {
-      console.log('[Background] Offscreen document ready (fast path)');
-      return;
-    }
-    
-    // Always check if offscreen document actually exists
-    const existingContexts = await chrome.runtime.getContexts({
-      contextTypes: ['OFFSCREEN_DOCUMENT'],
-      documentUrls: [chrome.runtime.getURL('offscreen.html')]
-    });
-
-    if (existingContexts.length > 0) {
-      console.log('[Background] Offscreen document already exists');
-      offscreenDocumentReady = true;
-      return;
-    }
-
-    // Document doesn't exist, create it
-    offscreenDocumentReady = false;
-    ttsModelReady = false;  // Reset model status when creating new document
-    chrome.storage.local.set({ modelStatus: 'loading' });  // Clear stale storage
-    creatingOffscreenDocument = true;
-    console.log('[Background] Creating offscreen document...');
-    await chrome.offscreen.createDocument({
-      url: 'offscreen.html',
-      reasons: ['AUDIO_PLAYBACK'],
-      justification: 'TTS synthesis and audio playback'
-    });
-    
-    console.log('[Background] Offscreen document created');
-    offscreenDocumentReady = true;
-  } catch (error) {
-    // Ignore "already exists" error
-    if (error.message?.includes('single offscreen document')) {
-      console.log('[Background] Offscreen document already exists (caught)');
-      offscreenDocumentReady = true;
-    } else {
-      console.error('[Background] Failed to create offscreen document:', error);
-    }
-  } finally {
-    creatingOffscreenDocument = false;
+  stopBadgeAnimation();
+  if (status === 'playing') {
+    chrome.action.setBadgeBackgroundColor({ color: '#4CAF50' }); // Light Green
+    chrome.action.setBadgeText({ text: '♪' });
+  } else if (status === 'paused') {
+    chrome.action.setBadgeBackgroundColor({ color: '#FFA500' }); // Orange
+    chrome.action.setBadgeText({ text: '⏸' });
+  } else {
+    chrome.action.setBadgeText({ text: '' });
   }
+}
+
+// ==== STATE ====
+
+async function getState(keys) {
+  return chrome.storage.session.get(keys);
+}
+
+async function setPlaybackStatus(status) {
+  await chrome.storage.session.set({ playbackStatus: status });
+  updateBadge(status);
+}
+
+// ==== OFFSCREEN DOCUMENT ====
+
+let creatingOffscreenDocument = null;  // Promise while a createDocument call is in flight
+
+async function hasOffscreenDocument() {
+  const contexts = await chrome.runtime.getContexts({
+    contextTypes: ['OFFSCREEN_DOCUMENT'],
+    documentUrls: [chrome.runtime.getURL(OFFSCREEN_URL)]
+  });
+  return contexts.length > 0;
+}
+
+/**
+ * Create the offscreen document if it doesn't exist
+ * Always checks the real document list - Chrome may have closed it since we last looked
+ */
+async function ensureOffscreenDocument() {
+  if (await hasOffscreenDocument()) return;
+  
+  if (!creatingOffscreenDocument) {
+    creatingOffscreenDocument = (async () => {
+      console.log('[Background] Creating offscreen document...');
+      await chrome.storage.session.set({ modelStatus: 'loading', modelError: null });
+      try {
+        await chrome.offscreen.createDocument({
+          url: OFFSCREEN_URL,
+          // AUDIO_PLAYBACK alone gets the document closed after 30s of silence (e.g. while paused).
+          // ONNX Runtime runs multi-threaded inference in web workers, so WORKERS also applies
+          reasons: ['AUDIO_PLAYBACK', 'WORKERS'],
+          justification: 'TTS synthesis (ONNX Runtime web workers) and audio playback'
+        });
+        console.log('[Background] Offscreen document created');
+      } catch (error) {
+        // Ignore "already exists" error
+        if (!error.message?.includes('single offscreen document')) {
+          throw error;
+        }
+      }
+    })().finally(() => {
+      creatingOffscreenDocument = null;
+    });
+  }
+  
+  await creatingOffscreenDocument;
+}
+
+async function closeOffscreenDocument() {
+  if (await hasOffscreenDocument()) {
+    console.log('[Background] Closing idle offscreen document');
+    await chrome.offscreen.closeDocument();
+  }
+  await chrome.storage.session.set({ modelStatus: 'unloaded' });
+}
+
+/**
+ * Send a message to the offscreen document
+ * @returns {Promise<any>} The response, or undefined if the document isn't there
+ */
+function sendToOffscreen(message) {
+  return chrome.runtime.sendMessage({ target: 'offscreen', ...message }).catch(() => undefined);
 }
 
 /**
  * Wait for TTS models to be loaded and ready
- * Checks storage status and polls until ready or timeout
+ * Asks the offscreen document directly so a closed document can't leave stale "ready" state
  * @param {number} timeoutMs - Maximum time to wait in milliseconds (default: 60000)
  * @returns {Promise<boolean>} True if ready, false if timeout or error
  */
 async function waitForTTSReady(timeoutMs = 60000) {
-  // First ensure offscreen document exists
-  await setupOffscreenDocument();
-  
-  // If we just created/are creating an offscreen document, don't trust cache
-  if (creatingOffscreenDocument) {
-    console.log('[Background] Offscreen document being created, waiting...');
-    // Wait for creation to complete
-    let attempts = 0;
-    while (creatingOffscreenDocument && attempts < 50) {
-      await new Promise(resolve => setTimeout(resolve, 100));
-      attempts++;
-    }
+  try {
+    await ensureOffscreenDocument();
+  } catch (error) {
+    console.error('[Background] Failed to create offscreen document:', error);
+    return false;
   }
   
-  // Check cached status (but verify with storage to avoid stale data)
-  if (ttsModelReady) {
-    // Double-check storage to make sure it's not stale
-    const { modelStatus } = await chrome.storage.local.get(['modelStatus']);
-    if (modelStatus === 'ready') {
-      console.log('[Background] TTS already ready (cached + verified)');
-      return true;
-    } else {
-      // Cache was stale, clear it
-      console.log('[Background] Cache was stale, clearing');
-      ttsModelReady = false;
-    }
-  }
-  
-  // Wait for model to load with progress updates
-  console.log('[Background] Waiting for TTS models to load...');
   const startTime = Date.now();
-  
   while (Date.now() - startTime < timeoutMs) {
-    // Check storage status
-    const { modelStatus: status } = await chrome.storage.local.get(['modelStatus']);
+    const status = await sendToOffscreen({ type: 'getStatus' });
     
-    if (status === 'ready') {
-      ttsModelReady = true;
-      console.log('[Background] TTS models loaded successfully');
-      return true;
-    }
-    
-    if (status === 'error') {
-      console.error('[Background] TTS model loading failed');
+    if (status?.ready) return true;
+    if (status?.error) {
+      console.error('[Background] TTS model loading failed:', status.error);
       return false;
     }
     
-    // Wait before checking again
     await new Promise(resolve => setTimeout(resolve, 200));
   }
   
@@ -182,81 +173,180 @@ async function waitForTTSReady(timeoutMs = 60000) {
   return false;
 }
 
-// Setup offscreen document on service worker startup
-setupOffscreenDocument();
+async function hasActiveSession() {
+  const status = await sendToOffscreen({ type: 'getStatus' });
+  return !!status?.hasSession;
+}
 
-// Also setup on browser startup
-chrome.runtime.onStartup.addListener(() => {
-  ttsModelReady = false;  // Reset on browser startup
-  setupOffscreenDocument();
-});
+// ==== INSTALL / CONTEXT MENU ====
 
-// Initialize on install
-chrome.runtime.onInstalled.addListener(() => {
+chrome.runtime.onInstalled.addListener(async () => {
   console.log('[Background] Extension installed/updated');
-  // Create context menu
+  
+  await chrome.contextMenus.removeAll();
   chrome.contextMenus.create({
     id: 'read-selection',
     title: 'Read with OfflineTTS',
     contexts: ['selection']
   });
   
-  // Set default settings
-  chrome.storage.local.set({
-    voice: 'M1',
-    speed: 1.0,
-    modelStatus: 'loading',
-    playbackStatus: 'stopped'
-  });
+  // Only fill in missing settings so updates keep the user's choices
+  const stored = await chrome.storage.local.get(Object.keys(DEFAULT_SETTINGS));
+  const missing = Object.fromEntries(
+    Object.entries(DEFAULT_SETTINGS).filter(([key]) => stored[key] === undefined)
+  );
+  if (Object.keys(missing).length > 0) {
+    await chrome.storage.local.set(missing);
+  }
   
-  ttsModelReady = false;
-  setupOffscreenDocument();
+  // State that older versions kept in local storage now lives in session storage
+  await chrome.storage.local.remove(['modelStatus', 'playbackStatus', 'backend']);
 });
 
-// Handle context menu clicks
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (info.menuItemId === 'read-selection') {
     console.log('[Background] Context menu: Read selection');
     const settings = await chrome.storage.local.get(['voice', 'speed']);
-    
-    // Show loading status immediately
-    notifyPopup('playbackStatus', { status: 'buffering' });
-    chrome.storage.local.set({ playbackStatus: 'buffering' });
-    
-    await speak(
+    speak(
       info.selectionText,
-      settings.voice || 'M1',
-      settings.speed || 1.0
+      settings.voice || DEFAULT_SETTINGS.voice,
+      settings.speed || DEFAULT_SETTINGS.speed,
+      tab?.id ?? null
     );
   }
 });
 
-// Handle messages from popup and content scripts
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+// ==== MESSAGES ====
+
+// Handle messages from popup, content scripts and the offscreen document
+chrome.runtime.onMessage.addListener((message) => {
   // Ignore messages targeted at offscreen document
   if (message.target === 'offscreen') {
     return false;
   }
   
-  if (message.type === 'readPage') {
-    readPage(message.tabId, message.voice, message.speed);
-    return true;
-  } else if (message.type === 'stopReading') {
-    stopReading();
-    return true;
-  } else if (message.type === 'pauseReading') {
-    pauseReading();
-    return true;
-  } else if (message.type === 'resumeReading') {
-    resumeReading();
-    return true;
-  } else if (message.type === 'speak') {
-    speak(message.text, message.voice, message.speed);
-    return true;
+  switch (message.type) {
+    // From popup
+    case 'warmup':
+      // Start loading models while the user looks at the popup
+      ensureOffscreenDocument().catch(error => {
+        console.error('[Background] Failed to create offscreen document:', error);
+      });
+      break;
+    case 'readPage':
+      readPage(message.tabId, message.voice, message.speed);
+      break;
+    case 'stopReading':
+      stopReading();
+      break;
+    case 'pauseReading':
+      pauseReading();
+      break;
+    case 'resumeReading':
+      resumeReading();
+      break;
+    case 'seek':
+      seekToChunk(message.chunkIndex);
+      break;
+    case 'skip':
+      skipChunks(message.delta);
+      break;
+    case 'setSpeed':
+      sendToOffscreen({ type: 'updateSpeed', speed: message.speed });
+      break;
+      
+    // From offscreen document
+    case 'modelStatus':
+      handleModelStatus(message);
+      break;
+    case 'backendStatus':
+      chrome.storage.session.set({ backend: message.backend });
+      break;
+    case 'playbackStatus':
+      handleOffscreenPlaybackStatus(message.status);
+      break;
+    case 'progressUpdate':
+      chrome.storage.session.set({
+        currentChunk: message.currentChunk,
+        totalChunks: message.totalChunks
+      });
+      break;
+    case 'chunkPlaying':
+      sendToReadingTab({
+        type: 'highlightChunk',
+        chunkText: message.chunkText,
+        chunkIndex: message.chunkIndex,
+        totalChunks: message.totalChunks
+      });
+      break;
+    case 'chunkPreload':
+      // Pre-send next chunk's highlight info so content script can prepare it
+      sendToReadingTab({
+        type: 'preloadHighlight',
+        chunkText: message.chunkText,
+        chunkIndex: message.chunkIndex
+      });
+      break;
+    case 'playbackComplete':
+      console.log('[Background] Playback complete');
+      finishPlayback();
+      break;
+    case 'playbackError':
+      console.error('[Background] Playback error:', message.message);
+      // Popup clears errors when playbackStatus changes, so report after the reset lands
+      finishPlayback().then(() => notifyPopup('error', message.message));
+      break;
+    case 'offscreenIdle':
+      handleOffscreenIdle();
+      break;
   }
   
   return false;
 });
+
+function handleModelStatus(message) {
+  if (message.status === 'ready') {
+    console.log('[Background] TTS model status: ready', message.backend || '');
+    chrome.storage.session.set({ modelStatus: 'ready', modelError: null, backend: message.backend });
+  } else if (message.status === 'error') {
+    console.error('[Background] TTS model status: error -', message.message);
+    chrome.storage.session.set({ modelStatus: 'error', modelError: message.message });
+  } else {
+    console.log('[Background] TTS model status:', message.status, message.message || '');
+    chrome.storage.session.set({ modelStatus: message.status });
+  }
+}
+
+async function handleOffscreenPlaybackStatus(status) {
+  // Ignore late updates from a session that was already stopped
+  const { playbackStatus } = await getState('playbackStatus');
+  if (!ACTIVE_STATUSES.includes(playbackStatus)) return;
+  await setPlaybackStatus(status);
+}
+
+async function handleOffscreenIdle() {
+  // A new read may have started after the offscreen document sent this
+  const { playbackStatus } = await getState('playbackStatus');
+  if (playbackStatus === 'buffering' || playbackStatus === 'playing') return;
+  await closeOffscreenDocument();
+}
+
+async function sendToReadingTab(message) {
+  const { readingTabId } = await getState('readingTabId');
+  if (readingTabId) {
+    chrome.tabs.sendMessage(readingTabId, message).catch(() => {});
+  }
+}
+
+function notifyPopup(type, data) {
+  // Handle string arguments (for error messages) vs object arguments
+  const payload = typeof data === 'string' ? { type, message: data } : { type, ...data };
+  chrome.runtime.sendMessage(payload).catch(() => {
+    // Popup might be closed, ignore error
+  });
+}
+
+// ==== READING ====
 
 /**
  * Extract and read text from a page
@@ -292,10 +382,9 @@ async function readPage(tabId, voice, speed) {
     // Check if it's a PDF - extract in offscreen document instead
     if (response.isPDF) {
       console.log('[Background] PDF detected, extracting via offscreen document');
-      await setupOffscreenDocument();
+      await ensureOffscreenDocument();
       
-      const pdfResponse = await chrome.runtime.sendMessage({
-        target: 'offscreen',
+      const pdfResponse = await sendToOffscreen({
         type: 'extractPDF',
         url: response.url
       });
@@ -323,9 +412,6 @@ async function readPage(tabId, voice, speed) {
       return;
     }
     
-    // DEBUG: Log text received from content.js
-    console.log('[Background] DEBUG text from content.js:', response.text.substring(0, 500).replace(/\n/g, '\\n'));
-    
     speak(response.text, voice, speed, tabId);
   } catch (error) {
     console.error('Error reading page:', error);
@@ -333,9 +419,8 @@ async function readPage(tabId, voice, speed) {
   }
 }
 
-// Debounce state for speak function
-let lastSpeakCall = 0;
-const SPEAK_DEBOUNCE_MS = 300;
+// Incremented by every speak/stop so a speak still waiting on model loading can tell it was superseded
+let speakRequestId = 0;
 
 /**
  * Speak the given text using TTS
@@ -344,245 +429,171 @@ const SPEAK_DEBOUNCE_MS = 300;
  * @param {string} voice - Voice ID (M1, M2, F1, F2)
  * @param {number} speed - Speed multiplier
  * @param {number|null} tabId - Tab ID for highlighting (optional)
+ * @param {number} startChunk - Chunk index to start from (optional)
  */
-async function speak(text, voice, speed, tabId = null) {
-  // Debounce rapid clicks (only when already playing)
-  const now = Date.now();
-  if (isPlaying && now - lastSpeakCall < SPEAK_DEBOUNCE_MS) {
-    console.log('[Background] Ignoring rapid click (debounced)');
-    return;
-  }
-  lastSpeakCall = now;
-  
+async function speak(text, voice, speed, tabId = null, startChunk = 0) {
   if (!text || text.trim().length === 0) {
     notifyPopup('error', 'No text to read');
     return;
   }
   
-  // Stop any current playback first (single session only)
-  if (isPlaying) {
-    console.log('[Background] Stopping current playback before starting new');
-    stopReading();
-    // Small delay to let stop propagate
-    await new Promise(resolve => setTimeout(resolve, 100));
-  }
+  // Single session only
+  await stopReading();
+  const requestId = ++speakRequestId;
   
-  // Set the tab ID for highlighting AFTER stopReading() clears the old one
-  if (tabId) {
-    currentReadingTabId = tabId;
-  }
+  // Saved so reading can resume at the same position if Chrome closes the offscreen document
+  await chrome.storage.session.set({
+    readingTabId: tabId,
+    resumeSession: { text, voice },
+    currentChunk: startChunk,
+    totalChunks: 0
+  }).catch(error => {
+    console.warn('[Background] Could not save resume state:', error.message);
+  });
+  await setPlaybackStatus('buffering');
   
-  // Update state - mark as buffering until audio actually starts
-  isPlaying = true;
-  chrome.storage.local.set({ playbackStatus: 'buffering' });
-  notifyPopup('playbackStatus', { status: 'buffering' });
-  startBufferingAnimation();
-  
-  // Wait for TTS models to be ready (this is the key fix!)
   console.log('[Background] Checking if TTS is ready...');
-  const ready = await waitForTTSReady(60000);  // 60 second timeout
+  const ready = await waitForTTSReady();
+  
+  if (requestId !== speakRequestId) {
+    console.log('[Background] Speak request superseded while loading');
+    return;
+  }
   
   if (!ready) {
     console.error('[Background] TTS not ready, cannot speak');
-    isPlaying = false;
-    chrome.storage.local.set({ playbackStatus: 'stopped' });
+    // Close the failed document so the next attempt starts fresh
+    await closeOffscreenDocument().catch(() => {});
+    await finishPlayback();
     notifyPopup('error', 'TTS models failed to load. Please reload the extension.');
-    notifyPopup('playbackStatus', { status: 'stopped' });
-    clearBadge();
     return;
   }
   
   console.log('[Background] Sending TTS request to offscreen document');
-  
-  // DEBUG: Log text being sent to offscreen
-  console.log('[Background] DEBUG text to offscreen:', text.substring(0, 500).replace(/\n/g, '\\n'));
-  
-  // Send to offscreen document for TTS processing
-  chrome.runtime.sendMessage({
-    target: 'offscreen',
-    type: 'tts',
-    text,
-    voice,
-    speed
-  });
+  const { playbackStatus } = await getState('playbackStatus');
+  sendToOffscreen({ type: 'tts', text, voice, speed, startChunk });
+  if (playbackStatus === 'paused') {
+    // User paused while models were loading
+    sendToOffscreen({ type: 'pauseTTS' });
+  }
 }
 
-function stopReading() {
+async function stopReading() {
   console.log('[Background] Stopping playback');
-  isPlaying = false;
-  isPaused = false;
-  currentChunk = 0;
-  totalChunks = 0;
-  chrome.storage.local.set({ playbackStatus: 'stopped' });
-  chrome.runtime.sendMessage({ target: 'offscreen', type: 'stopTTS' });
-  notifyPopup('playbackStatus', { status: 'stopped' });
-  clearBadge();
-  // Clear highlighting
-  if (currentReadingTabId) {
-    chrome.tabs.sendMessage(currentReadingTabId, { type: 'clearHighlight' }).catch(() => {});
-    currentReadingTabId = null;
-  }
+  speakRequestId++;
+  sendToOffscreen({ type: 'stopTTS' });
+  await finishPlayback();
 }
 
-let isPaused = false;
+/**
+ * Reset playback state and clear highlighting after stop, completion or error
+ */
+async function finishPlayback() {
+  const { readingTabId } = await getState('readingTabId');
+  if (readingTabId) {
+    chrome.tabs.sendMessage(readingTabId, { type: 'clearHighlight' }).catch(() => {});
+  }
+  await chrome.storage.session.set({ readingTabId: null, currentChunk: 0, totalChunks: 0 });
+  await chrome.storage.session.remove('resumeSession');
+  await setPlaybackStatus('stopped');
+}
 
-function pauseReading() {
+async function pauseReading() {
+  const { playbackStatus } = await getState('playbackStatus');
+  if (playbackStatus !== 'playing' && playbackStatus !== 'buffering') return;
+  
   console.log('[Background] Pausing playback');
-  isPaused = true;
-  chrome.storage.local.set({ playbackStatus: 'paused' });
-  chrome.runtime.sendMessage({ target: 'offscreen', type: 'pauseTTS' });
-  notifyPopup('playbackStatus', { status: 'paused' });
-  setPausedBadge();
+  await setPlaybackStatus('paused');
+  sendToOffscreen({ type: 'pauseTTS' });
 }
 
-function resumeReading() {
+async function resumeReading() {
+  const { playbackStatus, currentChunk } = await getState(['playbackStatus', 'currentChunk']);
+  if (playbackStatus !== 'paused') return;
+  
   console.log('[Background] Resuming playback');
-  isPaused = false;
-  chrome.storage.local.set({ playbackStatus: 'playing' });
-  chrome.runtime.sendMessage({ target: 'offscreen', type: 'resumeTTS' });
-  notifyPopup('playbackStatus', { status: 'playing' });
-  setPlayingBadge();
-}
-
-function notifyPopup(type, data) {
-  // Handle string arguments (for error messages) vs object arguments
-  const payload = typeof data === 'string' ? { type, message: data } : { type, ...data };
-  chrome.runtime.sendMessage(payload).catch(() => {
-    // Popup might be closed, ignore error
-  });
-}
-
-// Track current tab for highlighting
-let currentReadingTabId = null;
-
-// Track current playback position for keyboard shortcuts
-let currentChunk = 0;
-let totalChunks = 0;
-
-// Listen for messages from offscreen document
-chrome.runtime.onMessage.addListener((message) => {
-  if (message.type === 'modelStatus') {
-    // Update cached status
-    if (message.status === 'ready') {
-      ttsModelReady = true;
-      console.log('[Background] TTS model status: ready');
-      // Also save backend if provided
-      if (message.backend) {
-        chrome.storage.local.set({ backend: message.backend });
-        console.log('[Background] TTS backend:', message.backend);
-      }
-    } else if (message.status === 'error') {
-      ttsModelReady = false;
-      console.error('[Background] TTS model status: error -', message.message);
-    } else {
-      console.log('[Background] TTS model status:', message.status, message.message || '');
-    }
-    // Save to storage so popup can read it when opened
-    chrome.storage.local.set({ modelStatus: message.status });
-    notifyPopup('modelStatus', message);
-  } else if (message.type === 'backendStatus') {
-    // Handle dedicated backend status from offscreen
-    console.log('[Background] Backend status:', message.backend);
-    chrome.storage.local.set({ backend: message.backend });
-    notifyPopup('backendStatus', { backend: message.backend });
-  } else if (message.type === 'playbackComplete') {
-    console.log('[Background] Playback complete');
-    isPlaying = false;
-    isPaused = false;
-    chrome.storage.local.set({ playbackStatus: 'stopped' });
-    notifyPopup('playbackStatus', { status: 'stopped' });
-    clearBadge();
-    // Clear highlighting
-    if (currentReadingTabId) {
-      chrome.tabs.sendMessage(currentReadingTabId, { type: 'clearHighlight' }).catch(() => {});
-      currentReadingTabId = null;
-    }
-  } else if (message.type === 'playbackStatus') {
-    // Relay status updates from offscreen to popup
-    if (message.status === 'buffering') {
-      chrome.storage.local.set({ playbackStatus: 'buffering' });
-      startBufferingAnimation();
-    } else if (message.status === 'paused') {
-      isPaused = true;
-      chrome.storage.local.set({ playbackStatus: 'paused' });
-      setPausedBadge();
-    } else if (message.status === 'playing') {
-      isPaused = false;
-      isPlaying = true;
-      chrome.storage.local.set({ playbackStatus: 'playing' });
-      setPlayingBadge();
-    }
-    notifyPopup('playbackStatus', message);
-  } else if (message.type === 'chunkPlaying') {
-    // Relay chunk info to content script for highlighting
-    if (currentReadingTabId) {
-      chrome.tabs.sendMessage(currentReadingTabId, {
-        type: 'highlightChunk',
-        chunkText: message.chunkText,
-        chunkIndex: message.chunkIndex,
-        totalChunks: message.totalChunks
-      }).catch(() => {});
-    }
-  } else if (message.type === 'chunkPreload') {
-    // Pre-send next chunk's highlight info so content script can prepare it
-    if (currentReadingTabId) {
-      chrome.tabs.sendMessage(currentReadingTabId, {
-        type: 'preloadHighlight',
-        chunkText: message.chunkText,
-        chunkIndex: message.chunkIndex
-      }).catch(() => {});
-    }
-  } else if (message.type === 'progressUpdate') {
-    // Track position for keyboard shortcuts
-    currentChunk = message.currentChunk;
-    totalChunks = message.totalChunks;
-    
-    // Relay progress updates to popup for seek bar
-    notifyPopup('progressUpdate', {
-      currentChunk: message.currentChunk,
-      totalChunks: message.totalChunks
-    });
+  if (await hasActiveSession()) {
+    sendToOffscreen({ type: 'resumeTTS' });
+  } else {
+    await restartFromSavedSession(currentChunk || 0);
   }
-});
+}
 
-// Handle keyboard shortcuts
+async function seekToChunk(chunkIndex) {
+  const { playbackStatus } = await getState('playbackStatus');
+  if (!ACTIVE_STATUSES.includes(playbackStatus)) return;
+  
+  if (await hasActiveSession()) {
+    sendToOffscreen({ type: 'seekToChunk', chunkIndex });
+  } else {
+    await restartFromSavedSession(chunkIndex);
+  }
+}
+
+async function skipChunks(delta) {
+  const { playbackStatus, currentChunk } = await getState(['playbackStatus', 'currentChunk']);
+  if (!ACTIVE_STATUSES.includes(playbackStatus)) return;
+  
+  if (await hasActiveSession()) {
+    sendToOffscreen({ type: 'skip', delta });
+  } else {
+    await restartFromSavedSession((currentChunk || 0) + delta);
+  }
+}
+
+/**
+ * The offscreen document was closed (idle while paused, or by Chrome) -
+ * start a new session at the saved position
+ */
+async function restartFromSavedSession(chunkIndex) {
+  const { resumeSession, readingTabId } = await getState(['resumeSession', 'readingTabId']);
+  if (!resumeSession) {
+    await finishPlayback();
+    return;
+  }
+  
+  console.log('[Background] Offscreen session gone, restarting at chunk', chunkIndex);
+  const { speed } = await chrome.storage.local.get('speed');
+  speak(resumeSession.text, resumeSession.voice, speed || DEFAULT_SETTINGS.speed, readingTabId, Math.max(0, chunkIndex));
+}
+
+// ==== KEYBOARD SHORTCUTS ====
+
 chrome.commands.onCommand.addListener(async (command) => {
   console.log('[Background] Command received:', command);
+  const { playbackStatus } = await getState('playbackStatus');
   
   switch (command) {
     case 'play-pause':
-      if (isPlaying && !isPaused) {
+      if (playbackStatus === 'playing' || playbackStatus === 'buffering') {
         pauseReading();
-      } else if (isPaused) {
+      } else if (playbackStatus === 'paused') {
         resumeReading();
       } else {
         // Not playing, start reading current page
         const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
         if (tab) {
           const settings = await chrome.storage.local.get(['voice', 'speed']);
-          readPage(tab.id, settings.voice || 'M1', settings.speed || 1.0);
+          readPage(tab.id, settings.voice || DEFAULT_SETTINGS.voice, settings.speed || DEFAULT_SETTINGS.speed);
         }
       }
       break;
       
     case 'stop':
-      if (isPlaying || isPaused) {
+      if (ACTIVE_STATUSES.includes(playbackStatus)) {
         stopReading();
       }
       break;
       
     case 'skip-forward':
-      if (isPlaying || isPaused) {
-        const nextChunk = Math.min(totalChunks - 1, currentChunk + 1);
-        chrome.runtime.sendMessage({ target: 'offscreen', type: 'seekToChunk', chunkIndex: nextChunk });
-      }
+      skipChunks(1);
       break;
       
     case 'skip-back':
-      if (isPlaying || isPaused) {
-        const prevChunk = Math.max(0, currentChunk - 1);
-        chrome.runtime.sendMessage({ target: 'offscreen', type: 'seekToChunk', chunkIndex: prevChunk });
-      }
+      skipChunks(-1);
       break;
   }
 });
+
+// Restore the badge after the service worker restarts
+getState('playbackStatus').then(({ playbackStatus }) => updateBadge(playbackStatus));

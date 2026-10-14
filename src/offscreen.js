@@ -38,9 +38,8 @@ const backendStatusEl = document.getElementById('backend-status');
 // State
 let ttsEngine = null;
 let ttsReady = false;
+let initError = null;
 let voiceStyles = {};
-let currentAudio = null;
-let isPlaying = false;
 let currentBackend = 'unknown';
 
 // PDF extraction state
@@ -108,18 +107,6 @@ async function fetchVoiceStyleData(voice) {
   return data;
 }
 
-// ==== WEBGPU DETECTION ====
-
-async function detectWebGPU() {
-  if (!navigator.gpu) return false;
-  try {
-    const adapter = await navigator.gpu.requestAdapter();
-    return !!adapter;
-  } catch {
-    return false;
-  }
-}
-
 // ==== INITIALIZATION ====
 
 function updateBackendStatus(backend) {
@@ -171,8 +158,12 @@ async function initializeTTS() {
     
     console.log(`[Offscreen] TTS engine initialized successfully (backend: ${actualBackend})`);
     
+    // Nothing is playing yet; let background close us if the user never reads anything
+    startIdleTimer(IDLE_CLOSE_MS);
+    
   } catch (error) {
     console.error('[Offscreen] Failed to initialize TTS:', error);
+    initError = error.message;
     updateStatus('Error: ' + error.message);
     
     notifyBackground('modelStatus', {
@@ -184,150 +175,418 @@ async function initializeTTS() {
 
 // ==== TTS SYNTHESIS ====
 
-/**
- * Synthesize speech from text using TTS engine
- * @param {string} text - Text to synthesize
- * @param {string} voice - Voice ID
- * @param {number} speed - Speed multiplier
- * @param {number} steps - Number of denoising steps (default: 5)
- * @returns {Promise<Object>} Object containing wavBuffer, duration, sampleRate, synthTime, backend
- */
-async function synthesize(text, voice, speed, steps = 5) {
-  if (!ttsReady) {
-    throw new Error('TTS engine not initialized');
-  }
-  
-  // Load voice style if not already loaded
+const DENOISING_STEPS = 5;
+// User speed is applied via audio.playbackRate so it can change instantly mid-read;
+// synthesizing at a fixed rate keeps buffered and new chunks consistent
+const SYNTHESIS_SPEED = 1.0;
+
+class SynthesisCancelled extends Error {}
+
+// ONNX sessions must not run concurrently, so all synthesis goes through this queue
+let engineQueue = Promise.resolve();
+
+async function ensureVoiceStyle(voice) {
   if (!voiceStyles[voice]) {
     const voiceStyleData = await fetchVoiceStyleData(voice);
     voiceStyles[voice] = createStyleFromData(voiceStyleData);
   }
+  return voiceStyles[voice];
+}
+
+/**
+ * Synthesize speech from text using TTS engine
+ * @param {string} text - Text to synthesize
+ * @param {string} voice - Voice ID
+ * @param {Function} shouldContinue - Returns false when the result is no longer wanted
+ * @returns {Promise<Object>} Object containing wavBuffer, duration, synthTime
+ * @throws {SynthesisCancelled} If shouldContinue() turns false before or during synthesis
+ */
+async function synthesize(text, voice, shouldContinue) {
+  if (!ttsReady) {
+    throw new Error('TTS engine not initialized');
+  }
   
-  updateStatus(`Synthesizing speech (${voice}, ${speed}x, ${currentBackend})...`);
-  console.log(`[Offscreen] Synthesizing: "${text.substring(0, 50)}..." with voice ${voice} at ${speed}x (${currentBackend})`);
+  const style = await ensureVoiceStyle(voice);
   
-  const startTime = performance.now();
+  const run = engineQueue.then(async () => {
+    if (!shouldContinue()) throw new SynthesisCancelled();
+    
+    console.log(`[Offscreen] Synthesizing: "${text.substring(0, 50)}..." with voice ${voice} (${currentBackend})`);
+    const startTime = performance.now();
+    
+    const { wav, duration } = await ttsEngine.call(
+      text,
+      style,
+      DENOISING_STEPS,
+      SYNTHESIS_SPEED,
+      0.3,  // silence duration
+      () => {
+        // Called between denoising steps - abort early if the chunk is no longer needed
+        if (!shouldContinue()) throw new SynthesisCancelled();
+      }
+    );
+    
+    const synthTime = (performance.now() - startTime) / 1000;
+    console.log(`[Offscreen] Synthesis completed in ${synthTime.toFixed(2)}s, audio duration: ${duration[0].toFixed(2)}s`);
+    
+    return {
+      wavBuffer: writeWavFile(wav, ttsEngine.sampleRate),
+      duration: duration[0],
+      synthTime
+    };
+  });
   
-  // Call TTS engine
-  const { wav, duration } = await ttsEngine.call(
-    text,
-    voiceStyles[voice],
-    steps,
-    speed,
-    0.3,  // silence duration
-    (step, totalSteps) => {
-      console.log(`[Offscreen] Denoising step ${step}/${totalSteps}`);
-    }
-  );
-  
-  const endTime = performance.now();
-  const synthTime = ((endTime - startTime) / 1000).toFixed(2);
-  const audioDuration = duration[0];
-  console.log(`[Offscreen] Synthesis completed in ${synthTime}s, audio duration: ${audioDuration.toFixed(2)}s (${currentBackend})`);
-  
-  updateStatus('Synthesis complete');
-  
-  // Convert to WAV
-  const wavBuffer = writeWavFile(wav, ttsEngine.sampleRate);
-  
-  return {
-    wavBuffer,
-    duration: audioDuration,
-    sampleRate: ttsEngine.sampleRate,
-    synthTime: parseFloat(synthTime),
-    backend: currentBackend
-  };
+  engineQueue = run.catch(() => {});
+  return run;
 }
 
 // ==== CHUNKED PLAYBACK ====
 
-let textChunks = [];
-let currentChunkIndex = 0;
-let currentVoice = 'M1';
-let currentSpeed = 1.0;
-let stopRequested = false;
-
-// Pre-buffer state
-let audioBuffer = [];
-let isSynthesizing = false;
-let synthesizeIndex = 0;
-const BUFFER_AHEAD = 2;  // Number of audio chunks to pre-synthesize for smooth playback
+const BUFFER_AHEAD = 2;  // Number of audio chunks to pre-synthesize beyond the playing one
 const DEFAULT_CHUNK_MAX_LENGTH = 200;  // Default maximum chunk length for playback
+const IDLE_CLOSE_MS = 5 * 60 * 1000;     // Ask background to close us after 5 min with nothing to read
+const PAUSED_CLOSE_MS = 30 * 60 * 1000;  // ...or after 30 min paused (background can resume from saved position)
 
-// Seek/playback locking
-let isSeeking = false;
-let playbackSessionId = 0;
-let lastSeekTarget = -1;
-let lastSeekTime = 0;
+/**
+ * The active reading session. Replaced (never mutated back to life) on each new read,
+ * so async work can detect it is stale with `s !== session`.
+ * @type {{chunks: string[], voice: string, speed: number, playIndex: number,
+ *         buffer: Map<number, {url: string, duration: number}>,
+ *         synthesizing: number|null, paused: boolean, audio: HTMLAudioElement|null}|null}
+ */
+let session = null;
+let idleTimer = null;
 
-function cleanupAudio(audio) {
-  if (!audio) return;
+function startIdleTimer(ms) {
+  clearIdleTimer();
+  idleTimer = setTimeout(() => {
+    idleTimer = null;
+    console.log('[Offscreen] Idle, asking background to close offscreen document');
+    notifyBackground('offscreenIdle', {});
+  }, ms);
+}
+
+function clearIdleTimer() {
+  if (idleTimer) {
+    clearTimeout(idleTimer);
+    idleTimer = null;
+  }
+}
+
+function isCurrent(s) {
+  return s === session;
+}
+
+function isWanted(s, index) {
+  return isCurrent(s) && index >= s.playIndex && index <= s.playIndex + BUFFER_AHEAD;
+}
+
+/**
+ * Start a new reading session, replacing any current one
+ * @param {string} text - Text to read
+ * @param {string} voice - Voice ID (M1, M2, F1, F2)
+ * @param {number} speed - Playback speed multiplier
+ * @param {number} startChunk - Chunk index to start from (used to resume after the document was closed)
+ */
+function startSession(text, voice, speed, startChunk = 0) {
+  stopSession();
   
-  try {
-    audio.pause();
-    // Don't set src = '' as it triggers MEDIA_ERR_SRC_NOT_SUPPORTED
-  } catch (e) {
-    // Ignore errors during cleanup
+  if (!ttsReady) {
+    failSession(null, initError ? `TTS engine failed to load: ${initError}` : 'TTS engine not ready');
+    return;
+  }
+  
+  const chunks = chunkTextForPlayback(text, DEFAULT_CHUNK_MAX_LENGTH);
+  console.log(`[Offscreen] Text split into ${chunks.length} chunks`);
+  
+  if (chunks.length === 0) {
+    failSession(null, 'No text to read');
+    return;
+  }
+  
+  const s = {
+    chunks,
+    voice,
+    speed,
+    playIndex: Math.max(0, Math.min(chunks.length - 1, startChunk)),
+    buffer: new Map(),
+    synthesizing: null,
+    paused: false,
+    audio: null
+  };
+  session = s;
+  clearIdleTimer();
+  
+  updateStatus('Synthesizing...');
+  notifyBackground('playbackStatus', { status: 'buffering' });
+  sendProgressUpdate();
+  pumpSynthesis(s);
+}
+
+/**
+ * Keep the buffer filled with the playing chunk and BUFFER_AHEAD chunks after it.
+ * Only one pump runs per session; seeks just move playIndex and the pump follows.
+ */
+async function pumpSynthesis(s) {
+  if (!isCurrent(s) || s.synthesizing !== null) return;
+  
+  while (isCurrent(s)) {
+    const index = nextIndexToSynthesize(s);
+    if (index < 0) break;
+    
+    s.synthesizing = index;
+    try {
+      const result = await synthesize(s.chunks[index], s.voice, () => isWanted(s, index));
+      if (!isWanted(s, index)) continue;
+      
+      const url = URL.createObjectURL(new Blob([result.wavBuffer], { type: 'audio/wav' }));
+      s.buffer.set(index, { url, duration: result.duration });
+      console.log(`[Offscreen] Chunk ${index + 1}/${s.chunks.length} ready`);
+      
+      if (index === s.playIndex) {
+        tryPlay(s);
+      }
+    } catch (error) {
+      if (error instanceof SynthesisCancelled || !isCurrent(s)) continue;
+      console.error('[Offscreen] Synthesis error:', error);
+      failSession(s, `Speech synthesis failed: ${error.message}`);
+      return;
+    } finally {
+      s.synthesizing = null;
+    }
+  }
+}
+
+function nextIndexToSynthesize(s) {
+  const end = Math.min(s.chunks.length, s.playIndex + BUFFER_AHEAD + 1);
+  for (let i = s.playIndex; i < end; i++) {
+    if (!s.buffer.has(i)) return i;
+  }
+  return -1;
+}
+
+function releaseChunk(s, index) {
+  const entry = s.buffer.get(index);
+  if (entry) {
+    URL.revokeObjectURL(entry.url);
+    s.buffer.delete(index);
+  }
+}
+
+function stopAudio(s) {
+  if (s.audio) {
+    try {
+      s.audio.pause();
+      // Don't set src = '' as it triggers MEDIA_ERR_SRC_NOT_SUPPORTED
+    } catch (e) {
+      // Ignore errors during cleanup
+    }
+    s.audio = null;
   }
 }
 
 /**
- * Handle TTS request from background script
- * Stops any current playback, chunks text, synthesizes audio, and starts playback
- * @param {string} text - Text to synthesize
- * @param {string} voice - Voice ID (M1, M2, F1, F2)
- * @param {number} speed - Playback speed multiplier
+ * Play the chunk at playIndex if it is buffered; otherwise wait for synthesis.
+ * Automatically continues to the next chunk on completion.
  */
-async function handleTTSRequest(text, voice, speed) {
-  try {
-    stopPlayback();
-    stopRequested = false;
+function tryPlay(s) {
+  if (!isCurrent(s) || s.paused || s.audio) return;
+  
+  if (s.playIndex >= s.chunks.length) {
+    completeSession(s);
+    return;
+  }
+  
+  const index = s.playIndex;
+  const entry = s.buffer.get(index);
+  const totalChunks = s.chunks.length;
+  
+  if (!entry) {
+    updateStatus('Buffering...');
+    notifyBackground('playbackStatus', { status: 'buffering' });
+    pumpSynthesis(s);
+    return;
+  }
+  
+  const audio = new Audio(entry.url);
+  audio.playbackRate = s.speed;
+  s.audio = audio;
+  
+  audio.addEventListener('ended', () => {
+    if (!isCurrent(s) || s.audio !== audio) return;
     
-    playbackSessionId++;
-    console.log(`[Offscreen] Starting new TTS session: ${playbackSessionId}`);
+    s.audio = null;
+    releaseChunk(s, index);
+    s.playIndex++;
+    sendProgressUpdate();
+    tryPlay(s);
+    pumpSynthesis(s);
+  });
+  
+  audio.addEventListener('error', (e) => {
+    if (!isCurrent(s) || s.audio !== audio) return;
     
-    if (!ttsReady) {
-      throw new Error('TTS engine not ready');
+    const mediaError = e.target?.error;
+    const errorCodes = {
+      1: 'MEDIA_ERR_ABORTED',
+      2: 'MEDIA_ERR_NETWORK', 
+      3: 'MEDIA_ERR_DECODE',
+      4: 'MEDIA_ERR_SRC_NOT_SUPPORTED'
+    };
+    const errorName = errorCodes[mediaError?.code] || 'UNKNOWN';
+    console.error(`[Offscreen] Audio playback error: ${errorName}: ${mediaError?.message || 'No details available'}`);
+    failSession(s, `Audio playback failed (${errorName})`);
+  });
+  
+  notifyBackground('chunkPlaying', { 
+    chunkIndex: index,
+    chunkText: s.chunks[index],
+    totalChunks
+  });
+  
+  if (index + 1 < totalChunks) {
+    notifyBackground('chunkPreload', {
+      chunkIndex: index + 1,
+      chunkText: s.chunks[index + 1]
+    });
+  }
+  
+  audio.play().then(() => {
+    if (!isCurrent(s) || s.audio !== audio || s.paused) return;
+    
+    updateStatus(`Playing ${index + 1}/${totalChunks}...`);
+    notifyBackground('playbackStatus', { status: 'playing' });
+    pumpSynthesis(s);
+  }).catch(error => {
+    // play() rejects with AbortError when paused/stopped before it started - not a failure
+    if (!isCurrent(s) || s.audio !== audio || s.paused) return;
+    console.error('[Offscreen] Play error:', error);
+    failSession(s, `Audio playback failed: ${error.message}`);
+  });
+}
+
+function stopSession() {
+  const s = session;
+  if (!s) return;
+  
+  session = null;
+  stopAudio(s);
+  for (const index of [...s.buffer.keys()]) {
+    releaseChunk(s, index);
+  }
+  
+  updateStatus('Stopped');
+  startIdleTimer(IDLE_CLOSE_MS);
+}
+
+function completeSession(s) {
+  if (!isCurrent(s)) return;
+  stopSession();
+  updateStatus('Ready');
+  notifyBackground('playbackComplete', {});
+}
+
+/**
+ * End the session (if still current) and report the error to background
+ * @param {Object|null} s - Session that failed, or null for failures before a session exists
+ * @param {string} message - User-facing error message
+ */
+function failSession(s, message) {
+  if (s && !isCurrent(s)) return;
+  stopSession();
+  updateStatus('Error: ' + message);
+  notifyBackground('playbackError', { message });
+}
+
+function pausePlayback() {
+  const s = session;
+  if (!s || s.paused) return;
+  
+  s.paused = true;
+  if (s.audio) {
+    s.audio.pause();
+  }
+  updateStatus('Paused');
+  notifyBackground('playbackStatus', { status: 'paused' });
+  startIdleTimer(PAUSED_CLOSE_MS);
+  console.log('[Offscreen] Playback paused');
+}
+
+function resumePlayback() {
+  const s = session;
+  if (!s || !s.paused) return;
+  
+  s.paused = false;
+  clearIdleTimer();
+  
+  if (!s.audio) {
+    // Paused between chunks or while buffering
+    tryPlay(s);
+    return;
+  }
+  
+  const audio = s.audio;
+  audio.play().then(() => {
+    if (!isCurrent(s) || s.audio !== audio || s.paused) return;
+    updateStatus(`Playing ${s.playIndex + 1}/${s.chunks.length}...`);
+    notifyBackground('playbackStatus', { status: 'playing' });
+    console.log('[Offscreen] Playback resumed');
+  }).catch(error => {
+    if (!isCurrent(s) || s.audio !== audio || s.paused) return;
+    console.error('[Offscreen] Resume error:', error);
+    failSession(s, `Audio playback failed: ${error.message}`);
+  });
+}
+
+function updatePlaybackSpeed(newSpeed) {
+  if (!session) return;
+  
+  session.speed = newSpeed;
+  if (session.audio) {
+    session.audio.playbackRate = newSpeed;
+  }
+  console.log(`[Offscreen] Playback speed updated to ${newSpeed}x`);
+}
+
+/**
+ * Seek to a specific chunk index
+ * Keeps already-synthesized chunks that are still in range; the synthesis pump
+ * abandons any chunk that falls out of range
+ * @param {number} targetChunk - Zero-based chunk index to seek to
+ */
+function seekToChunk(targetChunk) {
+  const s = session;
+  if (!s) return;
+  
+  targetChunk = Math.max(0, Math.min(s.chunks.length - 1, targetChunk));
+  console.log(`[Offscreen] Seeking to chunk ${targetChunk}`);
+  
+  if (targetChunk === s.playIndex && s.audio) {
+    s.audio.currentTime = 0;
+    return;
+  }
+  
+  stopAudio(s);
+  s.playIndex = targetChunk;
+  for (const index of [...s.buffer.keys()]) {
+    if (!isWanted(s, index)) {
+      releaseChunk(s, index);
     }
-    
-    // Load voice style if not already loaded
-    if (!voiceStyles[voice]) {
-      const voiceStyleData = await fetchVoiceStyleData(voice);
-      voiceStyles[voice] = createStyleFromData(voiceStyleData);
-    }
-    
-    textChunks = chunkTextForPlayback(text, DEFAULT_CHUNK_MAX_LENGTH);
-    currentChunkIndex = 0;
-    synthesizeIndex = 0;
-    currentVoice = voice;
-    currentSpeed = speed;
-    audioBuffer = [];
-    
-    console.log(`[Offscreen] Text split into ${textChunks.length} chunks`);
-    
-    if (textChunks.length === 0) {
-      throw new Error('No text to synthesize');
-    }
-    
-    updateStatus('Synthesizing...');
-    await synthesizeNextChunks();
-    
-    playFromBuffer();
-    
-  } catch (error) {
-    console.error('[Offscreen] TTS error:', error);
-    updateStatus('Error: ' + error.message);
-    
-    // If error is "TTS engine not ready", don't report as error - it's loading
-    if (error.message === 'TTS engine not ready') {
-      console.log('[Offscreen] TTS called while still loading, ignoring');
-      // Don't send error status, let initialization continue
-    } else {
-      notifyBackground('modelStatus', {
-        status: 'error',
-        message: error.message
-      });
-    }
+  }
+  
+  sendProgressUpdate();
+  
+  if (s.paused) {
+    // Stay paused, but have the new position ready
+    pumpSynthesis(s);
+  } else {
+    tryPlay(s);
+  }
+}
+
+function skipChunks(delta) {
+  if (session) {
+    seekToChunk(session.playIndex + delta);
   }
 }
 
@@ -390,325 +649,6 @@ function chunkTextForPlayback(text, maxLen = 200) {
   }
   
   return chunks.filter(c => c.length > 0);
-}
-
-async function synthesizeNextChunks() {
-  if (isSynthesizing || stopRequested) {
-    return;
-  }
-  
-  isSynthesizing = true;
-  
-  try {
-    while (synthesizeIndex < textChunks.length && 
-           audioBuffer.length < BUFFER_AHEAD && 
-           !stopRequested) {
-      
-      const chunk = textChunks[synthesizeIndex];
-      const chunkNum = synthesizeIndex + 1;
-      const totalChunks = textChunks.length;
-      
-      console.log(`[Offscreen] Pre-synthesizing chunk ${chunkNum}/${totalChunks}: "${chunk.substring(0, 40)}..."`);
-      
-      const result = await synthesize(chunk, currentVoice, currentSpeed, 5);
-      
-      if (stopRequested) {
-        break;
-      }
-      
-      console.log(`[Offscreen] Chunk ${chunkNum} ready (${result.synthTime}s synth, ${result.duration.toFixed(2)}s audio)`);
-      
-      const audioBlob = new Blob([result.wavBuffer], { type: 'audio/wav' });
-      const audioUrl = URL.createObjectURL(audioBlob);
-      
-      audioBuffer.push({
-        url: audioUrl,
-        duration: result.duration,
-        chunkIndex: synthesizeIndex
-      });
-      
-      synthesizeIndex++;
-    }
-  } catch (error) {
-    console.error('[Offscreen] Synthesis error:', error);
-  } finally {
-    isSynthesizing = false;
-  }
-}
-
-/**
- * Play next audio chunk from the buffer
- * Handles buffering, audio element creation, event listeners, and progress tracking
- * Automatically continues to next chunk on completion
- */
-async function playFromBuffer() {
-  const sessionId = playbackSessionId;
-  
-  if (stopRequested) {
-    return;
-  }
-  
-  if (currentAudio) {
-    cleanupAudio(currentAudio);
-    currentAudio = null;
-  }
-  
-  if (audioBuffer.length === 0) {
-    if (synthesizeIndex < textChunks.length) {
-      updateStatus('Buffering...');
-      setTimeout(() => {
-        if (sessionId === playbackSessionId) {
-          playFromBuffer();
-        }
-      }, 100);
-      return;
-    } else {
-      isPlaying = false;
-      updateStatus('Ready');
-      notifyBackground('playbackComplete', {});
-      return;
-    }
-  }
-  
-  const audioData = audioBuffer.shift();
-  const chunkNum = audioData.chunkIndex + 1;
-  const totalChunks = textChunks.length;
-  
-  currentAudio = new Audio(audioData.url);
-  currentAudio.playbackRate = currentSpeed;
-  
-  updateStatus(`Buffering ${chunkNum}/${totalChunks}...`);
-  
-  if (audioData.chunkIndex === 0) {
-    await new Promise(resolve => setTimeout(resolve, 150));
-    
-    if (sessionId !== playbackSessionId) {
-      console.log('[Offscreen] Session changed during startup delay, aborting');
-      cleanupAudio(currentAudio);
-      currentAudio = null;
-      URL.revokeObjectURL(audioData.url);
-      return;
-    }
-  }
-  
-  // Defensive check: ensure currentAudio still exists (race condition protection)
-  if (!currentAudio) {
-    console.log('[Offscreen] currentAudio is null, aborting playback');
-    URL.revokeObjectURL(audioData.url);
-    return;
-  }
-  
-  currentAudio.addEventListener('ended', () => {
-    URL.revokeObjectURL(audioData.url);
-    
-    if (sessionId !== playbackSessionId) {
-      console.log('[Offscreen] Ignoring ended event from old session');
-      return;
-    }
-    
-    currentChunkIndex++;
-    playFromBuffer();
-    synthesizeNextChunks();
-  });
-  
-  currentAudio.addEventListener('error', (e) => {
-    if (sessionId !== playbackSessionId) return;
-    
-    const mediaError = e.target?.error;
-    const errorCodes = {
-      1: 'MEDIA_ERR_ABORTED',
-      2: 'MEDIA_ERR_NETWORK', 
-      3: 'MEDIA_ERR_DECODE',
-      4: 'MEDIA_ERR_SRC_NOT_SUPPORTED'
-    };
-    const errorCode = mediaError?.code;
-    const errorName = errorCodes[errorCode] || 'UNKNOWN';
-    const errorMsg = mediaError?.message || 'No details available';
-    
-    console.error(`[Offscreen] Audio playback error: ${errorName} (code ${errorCode}): ${errorMsg}`);
-    URL.revokeObjectURL(audioData.url);
-    updateStatus(`Playback error: ${errorName}`);
-    isPlaying = false;
-  });
-  
-  notifyBackground('chunkPlaying', { 
-    chunkIndex: audioData.chunkIndex,
-    chunkText: textChunks[audioData.chunkIndex],
-    totalChunks: totalChunks
-  });
-  
-  const nextChunkIndex = audioData.chunkIndex + 1;
-  if (nextChunkIndex < textChunks.length) {
-    notifyBackground('chunkPreload', {
-      chunkIndex: nextChunkIndex,
-      chunkText: textChunks[nextChunkIndex]
-    });
-  }
-  
-  try {
-    await currentAudio.play();
-    
-    if (sessionId !== playbackSessionId) {
-      console.log('[Offscreen] Session changed during play, aborting');
-      cleanupAudio(currentAudio);
-      currentAudio = null;
-      return;
-    }
-    
-    isPlaying = true;
-    updateStatus(`Playing ${chunkNum}/${totalChunks}...`);
-    
-    notifyBackground('playbackStatus', { status: 'playing' });
-    sendProgressUpdate();
-    synthesizeNextChunks();
-    
-  } catch (error) {
-    console.error('[Offscreen] Play error:', error);
-    URL.revokeObjectURL(audioData.url);
-  }
-}
-
-function stopPlayback() {
-  stopRequested = true;
-  isPaused = false;
-  
-  playbackSessionId++;
-  
-  if (currentAudio) {
-    cleanupAudio(currentAudio);
-    currentAudio = null;
-  }
-  
-  for (const audioData of audioBuffer) {
-    URL.revokeObjectURL(audioData.url);
-  }
-  audioBuffer = [];
-  
-  isPlaying = false;
-  isSynthesizing = false;
-  isSeeking = false;
-  textChunks = [];
-  currentChunkIndex = 0;
-  synthesizeIndex = 0;
-  
-  updateStatus('Stopped');
-}
-
-let isPaused = false;
-
-function pausePlayback() {
-  if (currentAudio && isPlaying && !isPaused) {
-    currentAudio.pause();
-    isPaused = true;
-    updateStatus('Paused');
-    notifyBackground('playbackStatus', { status: 'paused' });
-    console.log('[Offscreen] Playback paused');
-  }
-}
-
-function resumePlayback() {
-  if (currentAudio && isPaused) {
-    currentAudio.play().then(() => {
-      isPaused = false;
-      const chunkNum = currentChunkIndex + 1;
-      const totalChunks = textChunks.length;
-      updateStatus(`Playing ${chunkNum}/${totalChunks}...`);
-      notifyBackground('playbackStatus', { status: 'playing' });
-      console.log('[Offscreen] Playback resumed');
-    }).catch(error => {
-      console.error('[Offscreen] Resume error:', error);
-    });
-  } else if (!currentAudio && audioBuffer.length > 0) {
-    isPaused = false;
-    playFromBuffer();
-  }
-}
-
-function updatePlaybackSpeed(newSpeed) {
-  currentSpeed = newSpeed;
-  
-  if (currentAudio) {
-    currentAudio.playbackRate = newSpeed;
-    console.log(`[Offscreen] Playback speed updated to ${newSpeed}x`);
-  }
-}
-
-/**
- * Seek to a specific chunk index
- * Stops current playback, clears buffer, re-synthesizes from target chunk
- * @param {number} targetChunk - Zero-based chunk index to seek to
- */
-async function seekToChunk(targetChunk) {
-  console.log(`[Offscreen] Seeking to chunk ${targetChunk}`);
-  
-  if (textChunks.length === 0) return;
-  
-  // Reject duplicate seek requests within 500ms
-  const now = Date.now();
-  if (targetChunk === lastSeekTarget && now - lastSeekTime < 2000) {
-    console.log('[Offscreen] Ignoring duplicate seek to chunk', targetChunk);
-    return;
-  }
-  lastSeekTarget = targetChunk;
-  lastSeekTime = now;
-  
-  if (isSeeking) {
-    console.log('[Offscreen] Seek already in progress, ignoring');
-    return;
-  }
-  isSeeking = true;
-  
-  playbackSessionId++;
-  console.log(`[Offscreen] New playback session: ${playbackSessionId}`);
-  
-  try {
-    targetChunk = Math.max(0, Math.min(textChunks.length - 1, targetChunk));
-    
-    if (targetChunk === currentChunkIndex && currentAudio) {
-      currentAudio.currentTime = 0;
-      if (isPaused) {
-        currentAudio.play();
-        isPaused = false;
-        notifyBackground('playbackStatus', { status: 'playing' });
-      }
-      return;
-    }
-    
-    if (currentAudio) {
-      cleanupAudio(currentAudio);
-      currentAudio = null;
-    }
-    
-    for (const audioData of audioBuffer) {
-      URL.revokeObjectURL(audioData.url);
-    }
-    audioBuffer = [];
-    
-    currentChunkIndex = targetChunk;
-    synthesizeIndex = targetChunk;
-    
-    sendProgressUpdate();
-    
-    isPaused = false;
-    stopRequested = true;  // Signal ongoing synthesis to stop
-    
-    // Wait for ongoing synthesis to finish (if any)
-    let waitAttempts = 0;
-    while (isSynthesizing && waitAttempts < 50) {  // Max 500ms wait
-      await new Promise(resolve => setTimeout(resolve, 10));
-      waitAttempts++;
-    }
-    
-    stopRequested = false;  // Allow new synthesis to proceed
-    
-    updateStatus(`Seeking to chunk ${targetChunk + 1}...`);
-    notifyBackground('playbackStatus', { status: 'buffering' });
-    
-    await synthesizeNextChunks();
-    playFromBuffer();
-  } finally {
-    isSeeking = false;
-  }
 }
 
 // ==== PDF EXTRACTION ====
@@ -790,16 +730,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   
   console.log('[Offscreen] Received message:', message.type);
   
-  if (message.type === 'tts') {
-    handleTTSRequest(message.text, message.voice, message.speed);
+  if (message.type === 'getStatus') {
+    sendResponse({
+      ready: ttsReady,
+      error: initError,
+      hasSession: !!session,
+      paused: !!session?.paused
+    });
+  } else if (message.type === 'tts') {
+    startSession(message.text, message.voice, message.speed, message.startChunk || 0);
   } else if (message.type === 'stopTTS') {
-    stopPlayback();
+    stopSession();
   } else if (message.type === 'pauseTTS') {
     pausePlayback();
   } else if (message.type === 'resumeTTS') {
     resumePlayback();
   } else if (message.type === 'seekToChunk') {
     seekToChunk(message.chunkIndex);
+  } else if (message.type === 'skip') {
+    skipChunks(message.delta);
   } else if (message.type === 'updateSpeed') {
     updatePlaybackSpeed(message.speed);
   } else if (message.type === 'extractPDF') {
@@ -823,9 +772,10 @@ function updateStatus(message) {
 }
 
 function sendProgressUpdate() {
+  if (!session) return;
   notifyBackground('progressUpdate', {
-    currentChunk: currentChunkIndex,
-    totalChunks: textChunks.length
+    currentChunk: session.playIndex,
+    totalChunks: session.chunks.length
   });
 }
 
